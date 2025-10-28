@@ -33,12 +33,22 @@ from pydantic_settings import BaseSettings
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 
-# Optional: Whisper for local STT
+# Optional: Whisper for local STT (fallback)
 try:
     import whisper
     WHISPER_AVAILABLE = True
 except ImportError:
     WHISPER_AVAILABLE = False
+
+# Optional: IndicSeamless for Indian language STT (primary)
+try:
+    from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
+    import torch
+    import librosa
+    INDICSEAMLESS_AVAILABLE = True
+except ImportError:
+    INDICSEAMLESS_AVAILABLE = False
+    print("Warning: transformers/torch not available for IndicSeamless")
 
 # Optional: Language detection
 try:
@@ -68,6 +78,11 @@ class Settings(BaseSettings):
     )
     index_path: str = Field(default="./index", env="INDEX_PATH")
     whisper_model: str = Field(default="base", env="WHISPER_MODEL")
+    use_indicseamless: bool = Field(default=True, env="USE_INDICSEAMLESS")
+    indicseamless_model: str = Field(
+        default="ai4bharat/indic-wav2vec2-hindi",
+        env="INDICSEAMLESS_MODEL"
+    )
     host: str = Field(default="0.0.0.0", env="HOST")
     port: int = Field(default=8000, env="PORT")
     
@@ -145,6 +160,9 @@ class ServerState:
         self.metadata: Optional[Dict] = None
         self.model: Optional[SentenceTransformer] = None
         self.whisper_model: Optional[Any] = None
+        self.indicseamless_processor: Optional[Any] = None
+        self.indicseamless_model: Optional[Any] = None
+        self.device: str = "cuda" if torch.cuda.is_available() else "cpu" if INDICSEAMLESS_AVAILABLE else "cpu"
         self.start_time: datetime = datetime.now()
         self.ready: bool = False
 
@@ -214,17 +232,52 @@ def load_embedding_model():
 
 
 def load_whisper_model():
-    """Load Whisper model for STT (optional)"""
+    """Load Whisper model for STT (fallback for non-Indian languages)"""
     if not WHISPER_AVAILABLE:
-        print("Whisper not available - STT endpoint will be disabled")
+        print("Whisper not available - will use only IndicSeamless for STT")
         return
     
     try:
         print(f"Loading Whisper model: {settings.whisper_model}...")
         state.whisper_model = whisper.load_model(settings.whisper_model)
-        print(f"✓ Whisper model loaded")
+        print(f"✓ Whisper model loaded (fallback for non-Indian languages)")
     except Exception as e:
         print(f"Warning: Could not load Whisper model: {e}")
+
+
+def load_indicseamless_model():
+    """Load IndicSeamless/IndicWav2Vec2 model for Indian language STT (primary)"""
+    if not INDICSEAMLESS_AVAILABLE:
+        print("IndicSeamless dependencies not available - will use only Whisper")
+        return
+    
+    if not settings.use_indicseamless:
+        print("IndicSeamless disabled in settings - will use only Whisper")
+        return
+    
+    try:
+        print(f"Loading IndicSeamless model: {settings.indicseamless_model}...")
+        print(f"Using device: {state.device}")
+        
+        # Load processor and model using AI4Bharat's pretrained models
+        state.indicseamless_processor = AutoProcessor.from_pretrained(
+            settings.indicseamless_model,
+            token=False  # Public model, no auth needed
+        )
+        
+        state.indicseamless_model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            settings.indicseamless_model,
+            torch_dtype=torch.float16 if state.device == "cuda" else torch.float32,
+            token=False
+        )
+        
+        state.indicseamless_model.to(state.device)
+        state.indicseamless_model.eval()  # Set to evaluation mode
+        
+        print(f"✓ IndicSeamless model loaded on {state.device} (primary for Indian languages)")
+    except Exception as e:
+        print(f"Warning: Could not load IndicSeamless model: {e}")
+        print("Will fall back to Whisper for all languages")
 
 
 @app.on_event("startup")
@@ -237,7 +290,8 @@ async def startup_event():
     try:
         load_embedding_model()
         load_index_and_metadata()
-        load_whisper_model()
+        load_indicseamless_model()  # Load IndicSeamless first (primary)
+        load_whisper_model()  # Load Whisper second (fallback)
         
         state.ready = True
         print("=" * 70)
@@ -365,12 +419,15 @@ async def retrieve(request: RetrievalRequest):
 @app.post("/transcribe", response_model=TranscriptionResponse)
 async def transcribe_audio(audio: UploadFile = File(...)):
     """
-    Transcribe audio using Whisper (optional endpoint)
+    Transcribe audio using IndicSeamless (preferred for Indian languages) or Whisper (fallback)
     
     Accepts audio file and returns transcription with language detection.
+    Strategy:
+    - Try IndicSeamless first for better Indian language accuracy
+    - Fall back to Whisper for non-Indian languages or if IndicSeamless fails
     
     Args:
-        audio: Audio file (wav, mp3, etc.)
+        audio: Audio file (wav, mp3, webm, etc.)
         
     Returns:
         TranscriptionResponse with text and metadata
@@ -381,48 +438,151 @@ async def transcribe_audio(audio: UploadFile = File(...)):
           -F "audio=@recording.wav"
         ```
     """
-    if not WHISPER_AVAILABLE or state.whisper_model is None:
+    if not WHISPER_AVAILABLE and not state.indicseamless_model:
         raise HTTPException(
             status_code=501,
-            detail="Whisper STT not available. Install with: pip install openai-whisper"
+            detail="No STT model available. Install Whisper or IndicSeamless."
         )
+    
+    import tempfile
+    import time
     
     try:
         # Save uploaded file temporarily
-        import tempfile
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
+        suffix = ".wav"
+        if audio.filename:
+            suffix = os.path.splitext(audio.filename)[1] or ".wav"
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
             content = await audio.read()
             temp_file.write(content)
             temp_path = temp_file.name
         
-        # Transcribe with Whisper
-        result = state.whisper_model.transcribe(temp_path)
+        print(f"[STT] Transcribing audio file: {audio.filename} ({len(content)} bytes)")
         
-        # Clean up temp file
-        os.unlink(temp_path)
+        # Define Indian languages supported by IndicSeamless/IndicWav2Vec2
+        indian_languages = ['hi', 'bn', 'ta', 'te', 'mr', 'gu', 'kn', 'ml', 'pa', 'or', 'as', 'ur', 'en-IN']
         
-        # Calculate average confidence from segments
-        segments = result.get('segments', [])
-        avg_confidence = None
-        if segments:
-            confidences = [seg.get('no_speech_prob', 0) for seg in segments]
-            avg_confidence = 1.0 - (sum(confidences) / len(confidences))
+        # Try IndicSeamless first (better for Indian languages)
+        if state.indicseamless_model and state.indicseamless_processor:
+            try:
+                print("[STT] Using IndicSeamless for transcription...")
+                start_time = time.time()
+                
+                # Load audio with librosa (resampled to 16kHz)
+                audio_array, sample_rate = librosa.load(temp_path, sr=16000)
+                
+                # Process audio
+                inputs = state.indicseamless_processor(
+                    audio_array,
+                    sampling_rate=16000,
+                    return_tensors="pt",
+                    padding=True
+                )
+                
+                # Move inputs to device
+                inputs = {k: v.to(state.device) for k, v in inputs.items()}
+                
+                # Generate transcription
+                with torch.no_grad():
+                    generated_ids = state.indicseamless_model.generate(**inputs)
+                
+                # Decode transcription
+                transcription = state.indicseamless_processor.batch_decode(
+                    generated_ids,
+                    skip_special_tokens=True
+                )[0]
+                
+                elapsed_time = time.time() - start_time
+                
+                # Detect language from transcribed text
+                detected_lang = "hi"  # Default to Hindi
+                if LANGDETECT_AVAILABLE:
+                    try:
+                        detected_lang = detect(transcription)
+                    except:
+                        pass
+                
+                # Clean up temp file
+                os.unlink(temp_path)
+                
+                print(f"[STT] ✓ IndicSeamless transcription completed in {elapsed_time:.2f}s")
+                print(f"[STT] Transcription: {transcription[:100]}...")
+                
+                return TranscriptionResponse(
+                    text=transcription.strip(),
+                    language=detected_lang,
+                    confidence=0.85,  # IndicSeamless doesn't provide confidence, use default
+                    segments=[]  # Segment-level timestamps not available
+                )
+                
+            except Exception as indic_error:
+                print(f"[STT] IndicSeamless failed: {indic_error}")
+                print("[STT] Falling back to Whisper...")
+                # Continue to Whisper fallback
         
-        return TranscriptionResponse(
-            text=result['text'].strip(),
-            language=result.get('language', 'unknown'),
-            confidence=avg_confidence,
-            segments=[
-                {
-                    'start': seg['start'],
-                    'end': seg['end'],
-                    'text': seg['text'].strip()
-                }
-                for seg in segments
-            ]
+        # Fallback to Whisper
+        if state.whisper_model:
+            try:
+                print("[STT] Using Whisper for transcription...")
+                start_time = time.time()
+                
+                result = state.whisper_model.transcribe(temp_path)
+                
+                elapsed_time = time.time() - start_time
+                
+                # Clean up temp file
+                os.unlink(temp_path)
+                
+                # Calculate average confidence from segments
+                segments = result.get('segments', [])
+                avg_confidence = None
+                if segments:
+                    confidences = [seg.get('no_speech_prob', 0) for seg in segments]
+                    avg_confidence = 1.0 - (sum(confidences) / len(confidences))
+                else:
+                    avg_confidence = 0.8  # Default confidence
+                
+                print(f"[STT] ✓ Whisper transcription completed in {elapsed_time:.2f}s")
+                print(f"[STT] Transcription: {result['text'][:100]}...")
+                
+                return TranscriptionResponse(
+                    text=result['text'].strip(),
+                    language=result.get('language', 'unknown'),
+                    confidence=avg_confidence,
+                    segments=[
+                        {
+                            'start': seg['start'],
+                            'end': seg['end'],
+                            'text': seg['text'].strip()
+                        }
+                        for seg in segments
+                    ]
+                )
+                
+            except Exception as whisper_error:
+                # Clean up temp file on error
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Whisper transcription failed: {str(whisper_error)}"
+                )
+        
+        # No STT model available
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+        raise HTTPException(
+            status_code=501,
+            detail="No STT model available"
         )
         
+    except HTTPException:
+        raise
     except Exception as e:
+        # Clean up temp file on unexpected error
+        if 'temp_path' in locals() and os.path.exists(temp_path):
+            os.unlink(temp_path)
         raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
 
 

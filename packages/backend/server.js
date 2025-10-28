@@ -207,6 +207,83 @@ async function fetchMultipleStockPrices(symbols) {
 }
 
 /**
+ * Strip citations and source references from text for TTS
+ * Removes patterns like [source: filename p#], markdown formatting, and PDF references
+ * @param {string} text - Text with citations and formatting
+ * @returns {string} Clean text optimized for audio playback
+ */
+function stripCitationsForTTS(text) {
+  if (!text) return "";
+
+  let cleanText = text;
+
+  // 1. Remove all content within square brackets (citations, sources, references)
+  // Matches: [source: ...], [filename.pdf p#], [any text], etc.
+  cleanText = cleanText.replace(/\[[^\]]*\]/g, "");
+
+  // 2. Remove PDF file references with various formats
+  // Matches: 151.pdf p4, 151.pdf p.4, document.pdf page 4, etc.
+  cleanText = cleanText.replace(/\b\d+\.pdf\s+(p\.?|page)\s*\d+/gi, "");
+  cleanText = cleanText.replace(/\b[\w\-]+\.pdf\s+(p\.?|page)\s*\d+/gi, "");
+  cleanText = cleanText.replace(/\b[\w\-]+\.pdf\b/gi, ""); // Any remaining .pdf references
+
+  // 3. Remove markdown bold formatting (double asterisks)
+  cleanText = cleanText.replace(/\*\*([^*]+)\*\*/g, "$1");
+
+  // 4. Remove markdown italic formatting (single asterisks/underscores)
+  cleanText = cleanText.replace(/\*([^*]+)\*/g, "$1");
+  cleanText = cleanText.replace(/_([^_]+)_/g, "$1");
+
+  // 5. Remove markdown headers
+  cleanText = cleanText.replace(/#{1,6}\s+/g, "");
+
+  // 6. Remove markdown code blocks and inline code
+  cleanText = cleanText.replace(/```[\s\S]*?```/g, ""); // Code blocks
+  cleanText = cleanText.replace(/`([^`]+)`/g, "$1"); // Inline code
+
+  // 7. Remove markdown links, keep only the text
+  cleanText = cleanText.replace(/\[([^\]]+)\]\([^\)]+\)/g, "$1");
+
+  // 8. Remove HTML tags if any
+  cleanText = cleanText.replace(/<[^>]+>/g, "");
+
+  // 9. Remove special symbols that don't make sense in audio
+  cleanText = cleanText.replace(/[•●○■□▪▫]/g, ""); // Bullet points
+  cleanText = cleanText.replace(/[→←↑↓]/g, ""); // Arrows
+  cleanText = cleanText.replace(/[⚠️⚡✓✗❌✅]/g, ""); // Emoji/symbols
+
+  // 10. Remove page references in various formats
+  cleanText = cleanText.replace(/\(page\s+\d+\)/gi, "");
+  cleanText = cleanText.replace(/\(p\.\s*\d+\)/gi, "");
+
+  // 11. Clean up extra whitespace and special characters
+  cleanText = cleanText.replace(/\s{2,}/g, " "); // Multiple spaces to single
+  cleanText = cleanText.replace(/\n{2,}/g, "\n"); // Multiple newlines to single
+  cleanText = cleanText.replace(/\s+([.,!?;:])/g, "$1"); // Remove space before punctuation
+
+  // 12. Remove leading/trailing whitespace
+  cleanText = cleanText.trim();
+
+  // 13. Ensure proper sentence spacing
+  cleanText = cleanText.replace(/([.!?])\s*([A-Z])/g, "$1 $2");
+
+  console.log("[TTS Cleaning] Original length:", text.length);
+  console.log("[TTS Cleaning] Cleaned length:", cleanText.length);
+  console.log(
+    "[TTS Cleaning] Removed:",
+    text.length - cleanText.length,
+    "characters"
+  );
+
+  // Log a sample for debugging
+  if (cleanText.length > 100) {
+    console.log("[TTS Cleaning] Sample:", cleanText.substring(0, 100) + "...");
+  }
+
+  return cleanText;
+}
+
+/**
  * Initialize Express app
  */
 const app = express();
@@ -327,8 +404,67 @@ const limiter = rateLimit({
 });
 app.use("/chat", limiter);
 
-// Serve static audio files
-app.use("/audio", express.static(config.tempDir));
+// Serve static audio files with proper CORS headers and better error handling
+app.use(
+  "/audio",
+  cors({
+    origin: "*", // Allow all origins for audio files
+    credentials: false,
+    methods: ["GET", "HEAD", "OPTIONS"],
+  })
+);
+
+// Custom audio serving middleware with better error handling
+app.get("/audio/:filename", async (req, res) => {
+  try {
+    const filename = req.params.filename;
+    const filepath = path.join(config.tempDir, filename);
+
+    // Security check - prevent directory traversal
+    const normalizedPath = path.normalize(filepath);
+    if (!normalizedPath.startsWith(config.tempDir)) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    // Check if file exists
+    if (!fs.existsSync(filepath)) {
+      console.error(`[Audio] File not found: ${filename}`);
+      return res.status(404).json({ error: "Audio file not found" });
+    }
+
+    // Get file stats
+    const stats = fs.statSync(filepath);
+    if (stats.size === 0) {
+      console.error(`[Audio] Empty file: ${filename}`);
+      return res.status(500).json({ error: "Audio file is empty" });
+    }
+
+    console.log(`[Audio] Serving file: ${filename} (${stats.size} bytes)`);
+
+    // Set proper headers for audio playback
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Content-Length", stats.size);
+    res.setHeader("Accept-Ranges", "bytes");
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+
+    // Stream the file
+    const stream = fs.createReadStream(filepath);
+    stream.on("error", (error) => {
+      console.error(`[Audio] Stream error:`, error);
+      if (!res.headersSent) {
+        res.status(500).json({ error: "Failed to stream audio" });
+      }
+    });
+
+    stream.pipe(res);
+  } catch (error) {
+    console.error(`[Audio] Error serving file:`, error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+});
 
 // Multer for file uploads
 const upload = multer({
@@ -469,11 +605,12 @@ app.post("/chat/sendText", async (req, res) => {
       rag_sources: llmResponse.rag_sources,
     });
 
-    // 4. Generate TTS audio
+    // 4. Generate TTS audio (strip citations for clean audio)
     let ttsResult = null;
     if (config.enableTTS) {
       try {
-        ttsResult = await synthesizeTTS(llmResponse.text, llmResponse.language);
+        const cleanTextForTTS = stripCitationsForTTS(llmResponse.text);
+        ttsResult = await synthesizeTTS(cleanTextForTTS, llmResponse.language);
         console.log(`[TTS] Generated audio: ${ttsResult.audioUrl}`);
       } catch (ttsError) {
         console.error("[TTS] Synthesis failed:", ttsError.message);
@@ -595,11 +732,12 @@ app.post("/chat/sendAudio", upload.single("audio"), async (req, res) => {
       rag_sources: llmResponse.rag_sources,
     });
 
-    // Generate TTS
+    // Generate TTS (strip citations for clean audio)
     let ttsResult = null;
     if (config.enableTTS) {
       try {
-        ttsResult = await synthesizeTTS(llmResponse.text, llmResponse.language);
+        const cleanTextForTTS = stripCitationsForTTS(llmResponse.text);
+        ttsResult = await synthesizeTTS(cleanTextForTTS, llmResponse.language);
         console.log(`[TTS] Generated audio: ${ttsResult.audioUrl}`);
       } catch (ttsError) {
         console.error("[TTS] Synthesis failed:", ttsError.message);

@@ -219,22 +219,117 @@ function App() {
   };
 
   // Play audio
-  const handlePlayAudio = (url) => {
-    if (currentAudio) {
-      currentAudio.pause();
+  const handlePlayAudio = async (url) => {
+    try {
+      if (currentAudio) {
+        currentAudio.pause();
+        currentAudio.src = "";
+        setCurrentAudio(null);
+      }
+
+      // Ensure URL is absolute
+      const baseUrl = import.meta.env.VITE_API_URL || "http://localhost:4000";
+      const audioUrl = url.startsWith("http") ? url : `${baseUrl}${url}`;
+
+      console.log("[Audio] Attempting to play:", audioUrl);
+
+      // First, verify the audio file is accessible
+      try {
+        const testResponse = await fetch(audioUrl, { method: "HEAD" });
+        if (!testResponse.ok) {
+          throw new Error(`Audio file not found (HTTP ${testResponse.status})`);
+        }
+        const contentType = testResponse.headers.get("Content-Type");
+        const contentLength = testResponse.headers.get("Content-Length");
+        console.log("[Audio] Audio file verified:", {
+          contentType,
+          contentLength: `${contentLength} bytes`,
+          status: testResponse.status,
+        });
+
+        if (!contentType || !contentType.includes("audio")) {
+          throw new Error(`Invalid content type: ${contentType}`);
+        }
+
+        if (contentLength === "0") {
+          throw new Error("Audio file is empty");
+        }
+      } catch (err) {
+        console.error("[Audio] Failed to verify audio file:", err);
+        setError(`Audio file not accessible: ${err.message}`);
+        return;
+      }
+
+      // Create new audio element with better error handling
+      const audio = new Audio();
+
+      // Set up event listeners before setting src
+      audio.addEventListener("canplaythrough", () => {
+        console.log("[Audio] Audio is ready to play");
+      });
+
+      audio.addEventListener("loadedmetadata", () => {
+        console.log("[Audio] Metadata loaded, duration:", audio.duration);
+      });
+
+      audio.addEventListener("loadeddata", () => {
+        console.log("[Audio] Audio data loaded, starting playback");
+        audio
+          .play()
+          .then(() => {
+            console.log("[Audio] Playback started successfully");
+            setCurrentAudio(audio);
+          })
+          .catch((err) => {
+            console.error("[Audio] Playback failed:", err);
+            setError(`Failed to play audio: ${err.message}`);
+          });
+      });
+
+      audio.addEventListener("error", (e) => {
+        console.error("[Audio] Audio error event:", e);
+        console.error("[Audio] Error details:", {
+          code: audio.error?.code,
+          message: audio.error?.message,
+        });
+
+        let errorMsg = "Unknown error";
+        if (audio.error) {
+          switch (audio.error.code) {
+            case 1:
+              errorMsg = "Audio loading aborted";
+              break;
+            case 2:
+              errorMsg = "Network error while loading audio";
+              break;
+            case 3:
+              errorMsg = "Audio decoding failed - file may be corrupted";
+              break;
+            case 4:
+              errorMsg = "Audio format not supported by browser";
+              break;
+            default:
+              errorMsg = audio.error.message || "Unknown error";
+          }
+        }
+        setError(`Failed to play audio: ${errorMsg}`);
+      });
+
+      audio.addEventListener("ended", () => {
+        console.log("[Audio] Playback completed");
+        setCurrentAudio(null);
+      });
+
+      // Set crossOrigin before src to avoid CORS issues
+      audio.crossOrigin = "anonymous";
+
+      // Set the source and load
+      audio.src = audioUrl;
+      audio.load();
+    } catch (error) {
+      console.error("[Audio] Unexpected error:", error);
+      setError(`Audio error: ${error.message}`);
     }
-
-    // Ensure URL is absolute
-    const audioUrl = url.startsWith("http")
-      ? url
-      : `http://localhost:4000${url}`;
-
-    const audio = new Audio(audioUrl);
-    audio.play().catch((err) => {
-      console.error("[Audio] Playback failed:", err);
-      setError("Failed to play audio. The audio file may not be available.");
-    });
-    setCurrentAudio(audio);
   };
 
   // Toggle language
