@@ -65,7 +65,7 @@ const config = {
 
   // File upload
   maxAudioSize: parseInt(process.env.MAX_AUDIO_SIZE) || 10485760, // 10MB
-  tempDir: process.env.TEMP_DIR || "./temp",
+  tempDir: path.resolve(process.env.TEMP_DIR || "./temp"),
 
   // Rate limiting
   rateLimitWindow: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 900000, // 15 min
@@ -418,11 +418,12 @@ app.use(
 app.get("/audio/:filename", async (req, res) => {
   try {
     const filename = req.params.filename;
-    const filepath = path.join(config.tempDir, filename);
+    const filepath = path.resolve(path.join(config.tempDir, filename));
 
     // Security check - prevent directory traversal
-    const normalizedPath = path.normalize(filepath);
-    if (!normalizedPath.startsWith(config.tempDir)) {
+    const resolvedTempDir = path.resolve(config.tempDir);
+    if (!filepath.startsWith(resolvedTempDir)) {
+      console.error(`[Audio] Security: ${filepath} not in ${resolvedTempDir}`);
       return res.status(403).json({ error: "Access denied" });
     }
 

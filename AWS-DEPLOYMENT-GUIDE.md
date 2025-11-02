@@ -287,15 +287,17 @@ services:
     restart: unless-stopped
     networks:
       - cfs-network
-
   rag_service:
     build: ./packages/rag_service
     ports:
       - "8000:8000"
     volumes:
-      - ./data:/app/data
+      - ./data/pdfs:/app/data/pdfs
+      - ./data/faiss_index:/app/data/faiss_index
     environment:
       - PYTHONUNBUFFERED=1
+      - INDEX_PATH=/app/data/faiss_index
+      - EMBEDDING_MODEL=paraphrase-multilingual-mpnet-base-v2
     restart: unless-stopped
     networks:
       - cfs-network
@@ -789,6 +791,39 @@ sudo kill -9 <PID>
 ```bash
 # Increase Python workers in Dockerfile
 CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+```
+
+#### 6. RAG service fails with "Index directory not found"
+
+This happens when the FAISS index path is misconfigured:
+
+```bash
+# Check if index exists on host
+ls -la data/faiss_index/
+
+# Verify the files are present
+# Expected: faiss_index.bin, metadata.pkl, index_summary.json
+
+# If files are missing, you need to generate them first
+docker-compose exec rag_service python ingest.py
+
+# If files exist but RAG service still fails, check docker-compose.yml
+# Ensure INDEX_PATH environment variable is set correctly:
+# environment:
+#   - INDEX_PATH=/app/data/faiss_index
+
+# Restart the RAG service
+docker-compose restart rag_service
+```
+
+**Note**: The RAG service expects the FAISS index to be pre-generated. If you're deploying for the first time, make sure to:
+
+1. Copy your local `data/faiss_index/` directory to the EC2 instance
+2. Or run the ingest script inside the container to generate the index
+
+```bash
+# Generate index from PDFs (one-time setup)
+docker-compose exec rag_service python ingest.py
 ```
 
 ### Health Checks

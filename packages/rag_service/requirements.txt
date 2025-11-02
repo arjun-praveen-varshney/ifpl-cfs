@@ -20,9 +20,9 @@ PyPDF2==3.0.1
 # Whisper STT (fallback for non-Indian languages)
 openai-whisper==20231117
 
-# IndicSeamless for Indian language STT (primary)
-# Note: Install manually if needed: pip install git+https://github.com/AI4Bharat/IndicSeamless.git
-# For now, we'll use transformers + AI4Bharat models
+# IndicConformer for Indian language STT (primary - BhasaAnuvaad trained, 600M params, 22 languages)
+# Uses transformers package above with AI4Bharat models
+# Model: ai4bharat/indic-conformer-600m-multilingual
 
 # Language Detection
 langdetect==1.0.9
@@ -34,9 +34,8 @@ pydantic==2.5.3
 pydantic-settings==2.1.0
 yfinance==0.2.28
 
-# Audio Processing (for Whisper and IndicSeamless)
+# Audio Processing (for Whisper and IndicConformer)
 ffmpeg-python==0.2.0
-soundfile==0.12.1
 librosa==0.10.1
 torchaudio==2.1.2
 
@@ -51,7 +50,3 @@ loguru==0.7.2
 # Optional: Advanced text processing
 nltk==3.8.1
 spacy==3.7.2
-
-# Optional: For production vector DB alternatives
-# weaviate-client==3.26.0
-# pymilvus==2.3.4

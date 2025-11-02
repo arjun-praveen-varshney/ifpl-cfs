@@ -13,9 +13,9 @@ services:
       - ./packages/rag_service:/app
       - ./data/pdfs:/app/data/pdfs
       - ./data/faiss_index:/app/data/faiss_index
-      - rag_cache:/root/.cache # Cache for model downloads
-    environment:
+      - rag_cache:/root/.cache # Cache for model downloads    environment:
       - PDF_DIRECTORY=/app/data/pdfs
+      - INDEX_PATH=/app/data/faiss_index
       - FAISS_INDEX_PATH=/app/data/faiss_index/faiss_index.bin
       - METADATA_PATH=/app/data/faiss_index/metadata.pkl
       - EMBEDDING_MODEL=paraphrase-multilingual-mpnet-base-v2
